@@ -1,0 +1,8 @@
+# Optional private candidates. Install only after post-exam authorization, from local wheels.
+# Exact audited source commits are recorded in docs/study-loop/component-audit.json.
+nectivon-import-core==0.1.0rc1
+nectivon-evidence-core==0.1.0rc1
+nectivon-search-core==0.1.0rc1
+nectivon-export-core==0.1.0rc1
+nectivon-model-adapter==0.1.0rc1
+nectivon-task-engine==0.1.0rc1

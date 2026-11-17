@@ -1,0 +1,185 @@
+/* Nectivon owns imports, persistence, AI and mastery; this component is a view. */
+/* 手势/语音控制（移植自 star-vault）：摄像头面板与手势光标交还给组件脚本控制。 */
+#settingsBtn, #settings, #arBar, #arLayer, #llmPanel { display: none !important; }
+html, body { height: 100%; }
+:root { --nv-footer-height: 104px; }
+#sky { bottom: var(--nv-footer-height); overflow: hidden; }
+.plate { top: 24px; }
+#nectivon-error { position: fixed; bottom: 15px; left: 15px; z-index: 100;
+  padding: 12px; color: #fff; background: #663515; border-radius: 8px; }
+
+/* 星图下方：七项说明合为一排，窄屏横向滚动，不折成两行。 */
+.nv-footer {
+  position: fixed;
+  inset: auto 0 0;
+  z-index: 7;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 12px 10px;
+  border-top: 1px solid var(--hair);
+  background: #080d1c;
+}
+.nv-footer .gestures {
+  position: static;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3px;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0;
+}
+.nv-footer .gestures li {
+  flex: none;
+  padding: 6px 7px;
+  gap: 7px;
+  white-space: nowrap;
+}
+.keys { display: none; }
+.nv-relation-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 5px 8px;
+  color: var(--brass);
+  font-size: 12px;
+}
+.nv-relation-progress[hidden] { display: none; }
+.nv-relation-progress span { min-width: 0; overflow-wrap: anywhere; }
+.lens { bottom: calc(var(--nv-footer-height) + 12px); }
+.edge { top: calc((100% - var(--nv-footer-height)) / 2); }
+.folio { top: 68px; max-height: calc(100vh - var(--nv-footer-height) - 320px); }
+
+/* 朗读与手势语音选项保留在星图右上角。 */
+.nv-options {
+  position: fixed;
+  top: 14px;
+  right: 18px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: calc(100vw - 36px);
+  padding: 7px 12px;
+  border: 1px solid var(--hair);
+  border-radius: 12px;
+  background: rgba(10, 16, 36, 0.82);
+  color: var(--starlight);
+  font-size: 12px;
+}
+
+/* 蓝框：紧贴说明行下方居中，正常文档流保证两排不会遮挡。 */
+.nv-bar {
+  position: static;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  width: max-content;
+  max-width: 100%;
+  padding: 7px 14px;
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  background: rgba(10, 16, 36, 0.62);
+  color: var(--starlight);
+  font-size: 12px;
+}
+.nv-bar input[type='text'] {
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* 语音反馈紧跟说话按钮，整组按实际宽度居中；长文本不会撑出页脚。 */
+.nv-bar .v-text {
+  min-width: 0;
+  max-width: min(320px, calc(100vw - 60px));
+}
+/* 页面通用语音增强会包裹输入框；隐藏打字框时也隐藏其附加麦克风。 */
+.nv-bar .nectivon-voice-inline:has(input[hidden]) { display: none; }
+.nv-btn {
+  flex: none;
+  padding: 5px 14px;
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  background: none;
+  color: var(--starlight);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+}
+.nv-btn:hover { border-color: var(--dust); }
+.nv-btn.on {
+  border-color: rgba(227, 197, 138, 0.7);
+  color: var(--brass);
+  background: rgba(227, 197, 138, 0.1);
+}
+.nv-sep {
+  flex: none;
+  width: 1px;
+  height: 14px;
+  background: var(--hair);
+}
+.nv-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--dust);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.nv-opt:hover { color: var(--starlight); }
+.nv-opt input { accent-color: #e3c58a; margin: 0; }
+.nv-layout-controls {
+  position: fixed; top: 55px; right: 18px; z-index: 9;
+  display: flex; gap: 8px; padding: 5px;
+  border-radius: 12px; background: rgba(10, 16, 36, 0.82);
+}
+.nv-preview-banner {
+  position: fixed; top: 10px; left: 18px; z-index: 12;
+  max-width: calc(100vw - 290px); padding: 7px 12px;
+  border: 1px solid #d4a848; border-radius: 10px;
+  color: #ffe5a0; background: rgba(53, 37, 9, 0.9); font-size: 12px;
+}
+
+/* 窄屏仍保留说明在上、按钮在下的排列；摄像头跟随实际页脚高度避让。 */
+@media (max-width: 760px) {
+  .nv-footer { padding-inline: 8px; }
+  .nv-footer .gestures { width: 100%; }
+  .nv-options {
+    top: 10px;
+    right: 12px;
+    gap: 8px;
+    max-width: calc(100vw - 24px);
+  }
+  .lens { right: 12px; width: min(200px, calc(100vw - 24px)); }
+  .nv-bar { border-radius: 14px; }
+  .nv-bar .v-input {
+    flex-basis: 100%;
+    min-width: 0;
+  }
+}
+
+/* Colour-only skins; all original controls, help, geometry and type sizes remain. */
+:root { --nv-background:#f6f8fa; --nv-surface:#ffffff; --nv-border:#dce3eb;
+  --nv-text:#202c3b; --nv-muted:#5c6c80; --nv-accent:#287a69; --nv-soft:#e7f3ee; }
+.nv-options, .nv-layout-controls, .nv-footer, .nv-bar {
+  color:var(--nv-text); background:var(--nv-surface); border-color:var(--nv-border); }
+.nv-options .nv-opt, .nv-footer .nv-opt, .nv-footer .v-text,
+.nv-footer .gestures li, .nv-footer .gestures em { color:var(--nv-muted); }
+.nv-options .nv-opt:hover, .nv-footer .nv-opt:hover,
+.nv-footer .nv-btn, .nv-layout-controls .nv-btn { color:var(--nv-text); border-color:var(--nv-border); }
+.nv-footer .nv-btn.on, .nv-layout-controls .nv-btn.on {
+  color:var(--nv-accent); background:var(--nv-soft); border-color:var(--nv-accent); }
+.nv-options input, .nv-footer input { accent-color:var(--nv-accent); }
+.nv-footer .v-input { color:var(--nv-text); background:var(--nv-background); border-color:var(--nv-border); }
+.nv-footer .v-input::placeholder { color:var(--nv-muted); }
+.nv-footer .v-text.live, .nv-footer .v-text.hit, .nv-relation-progress { color:var(--nv-accent); }
+.nv-footer .v-text.live::before { background:var(--nv-accent); }
+.nv-footer .nv-sep { background:var(--nv-border); }

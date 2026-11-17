@@ -1,0 +1,436 @@
+"""Platform knowledge graph with historical questions, separate from study storage.
+
+Historical questions/families and source anchors stay in their original tables.
+Only explicit graph links and knowledge metadata are edited here. This view
+neither reads study-loop records nor computes or updates mastery.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from src.database import Database, DatabaseError
+from src.knowledge_taxonomy import FEATURED_SUBJECTS, SECONDARY_SUBJECTS, subject_tag
+from src.models import KnowledgeRelationType
+
+NODE_KINDS = {"question": "历史题目", "knowledge": "知识点", "family": "历史归纳族",
+              "page": "来源页", "document": "来源文档"}
+
+
+@dataclass(frozen=True)
+class KnowledgeGraph:
+    """Bounded view of live entities, with explicit truncation information."""
+
+    nodes: dict[str, dict[str, Any]]
+    links: list[dict[str, str]]
+    total: int
+    shown: int
+    is_preview: bool = False
+
+    def primary_subjects(self) -> tuple[str, ...]:
+        """Return only represented subjects, keeping known order and custom labels."""
+
+        roots = {tag.split("/", 1)[0] for node in self.nodes.values() for tag in node["tags"]}
+        return (*(root for root in FEATURED_SUBJECTS if root in roots),
+                *sorted(roots.difference(FEATURED_SUBJECTS)))
+
+    def star_payload(self, *, subject: str | None = None) -> dict[str, Any]:
+        """Adapt to star-vault's in-memory note contract; never write a vault."""
+
+        from src.knowledge_graph_generation import graph_contract
+
+        notes = list(self.nodes.values())
+        if subject is not None:
+            if subject not in self.primary_subjects():
+                raise ValueError("一级星云不存在，请重新选择。")
+            notes = [dict(node, tags=[tag for tag in node["tags"]
+                                     if tag.split("/", 1)[0] == subject])
+                     for node in notes
+                     if any(tag.split("/", 1)[0] == subject for tag in node["tags"])]
+            tags = {tag for node in notes for tag in node["tags"]}
+            children = tuple(dict.fromkeys((
+                *(f"{subject}/{child}" for child in SECONDARY_SUBJECTS.get(subject, ())
+                  if f"{subject}/{child}" in tags),
+                *sorted(tag for tag in tags if "/" in tag),
+            )))
+            groups = [self._star_group(tag, tag.split("/", 1)[1]) for tag in children]
+            if subject in tags:
+                groups.append(self._star_group(subject, "待细分"))
+        else:
+            groups = [self._star_group(root, root) for root in self.primary_subjects()]
+        identifiers = {node["id"] for node in notes}
+        links = [dict(link, cross_subject=True) if self._cross_subject_link(link) else link
+                 for link in self.links
+                 if link["source"] in identifiers and link["target"] in identifiers]
+        # The legacy vault envelope remains compatible with the upstream
+        # renderer. The bridge consumes this canonical contract first.
+        contract = graph_contract(KnowledgeGraph(
+            {node["id"]: node for node in notes}, links, self.total, self.shown,
+            is_preview=self.is_preview,
+        ))
+        return {
+            "knowledge_graph": contract,
+            "is_preview": self.is_preview,
+            "mode": "nectivon", "vaultName": (f"{subject} · 二级星云" if subject else
+                                              "Nectivon 知识星图"),
+            "config": {"constellations": {"groups": groups,
+                                          "nested": "full" if subject else "top"}},
+            "vault": {"vault": "Nectivon", "notes": notes,
+                      "links": links,
+                      "stats": {"notes": len(notes), "links": len(links),
+                                "unresolved": 0}},
+        }
+
+    def _cross_subject_link(self, link: dict[str, str]) -> bool:
+        """Mark saved relations spanning subjects, including multi-subject endpoints."""
+
+        if not all(link[end].startswith("knowledge:") for end in ("source", "target")):
+            return False
+        roots = [{tag.split("/", 1)[0] for tag in self.nodes[link[end]]["tags"]}
+                 for end in ("source", "target")]
+        return bool(roots[0] and roots[1] and len(roots[0] | roots[1]) > 1)
+
+    @staticmethod
+    def _star_group(tag: str, name: str) -> dict[str, Any]:
+        """Keep each group's colour stable across filtering and application reruns."""
+
+        palette = ("#6FA2FF", "#FF9A62", "#B48CFF", "#58DCCB", "#FF7FA6", "#8FD17A",
+                   "#F2D16B", "#7FD3FF", "#FF8A7A", "#C5A3FF", "#9BE0A8", "#E8B07E")
+        index = int.from_bytes(hashlib.sha256(tag.encode("utf-8")).digest()[:2], "big")
+        return {"id": f"g:{tag}", "name": name, "latin": "", "tags": [tag],
+                "tint": palette[index % len(palette)]}
+
+
+class KnowledgeGraphService:
+    """Read current shared assets and persist only user-submitted cross references."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def link_question(self, question_id: int, knowledge_object_id: int, *, note: str = "") -> None:
+        """Add an idempotent reference; never overwrite an existing annotation."""
+
+        if len(note) > 1000:
+            raise ValueError("关联说明不能超过 1000 个字符。")
+        try:
+            with self._database._connection() as connection:
+                for table, identifier in (("question_items", question_id),
+                                          ("knowledge_objects", knowledge_object_id)):
+                    if connection.execute(
+                        f"SELECT id FROM {table} WHERE id = ?", (identifier,)
+                    ).fetchone() is None:
+                        raise ValueError("关联的题目或知识点已不存在，请刷新后重选。")
+                connection.execute(
+                    "INSERT INTO question_knowledge_links "
+                    "(question_id, knowledge_object_id, note, created_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(question_id, knowledge_object_id) DO NOTHING",
+                    (question_id, knowledge_object_id, note.strip(), datetime.now(UTC).isoformat()),
+                )
+        except sqlite3.Error as exc:
+            raise DatabaseError("保存题目与知识点的关联失败，请稍后重试。") from exc
+
+    def list_question_links(self, question_id: int) -> list[dict[str, Any]]:
+        """Return existing graph links for one historical question.
+
+        Each row carries the human title plus the stored note/timestamp so the
+        independent graph can show existing links without re-deriving anything.
+        Deleted knowledge objects degrade to an empty title rather than
+        breaking the read.
+        """
+
+        try:
+            with self._database._connection() as connection:
+                rows = connection.execute(
+                    "SELECT l.knowledge_object_id, l.note, l.created_at, "
+                    "       k.title AS title, k.lifecycle AS lifecycle "
+                    "FROM question_knowledge_links l "
+                    "LEFT JOIN knowledge_objects k ON k.id = l.knowledge_object_id "
+                    "WHERE l.question_id = ? ORDER BY l.created_at, l.knowledge_object_id",
+                    (question_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise DatabaseError("读取题目关联的知识点失败，请稍后重试。") from exc
+        return [dict(row) for row in rows]
+
+    def unlink_question(
+        self, question_id: int, knowledge_object_id: int
+    ) -> None:
+        """Remove one question↔knowledge reference; neither asset is deleted."""
+
+        try:
+            with self._database._connection() as connection:
+                connection.execute(
+                    "DELETE FROM question_knowledge_links "
+                    "WHERE question_id = ? AND knowledge_object_id = ?",
+                    (question_id, knowledge_object_id),
+                )
+        except sqlite3.Error as exc:
+            raise DatabaseError("解除题目与知识点的关联失败，请稍后重试。") from exc
+
+    def snapshot(self, *, query: str = "", limit: int = 300) -> KnowledgeGraph:
+        """Project live assets and their actual edges; do not infer semantic relations.
+
+        The cap applies to primary learning/knowledge nodes. Their source nodes
+        are included afterwards so a bounded view still preserves traceability.
+        Filtering uses SQLite bound parameters. Historical nodes have no
+        inferred mastery status and are not linked to the independent study DB.
+        """
+
+        if not 1 <= limit <= 1000:
+            raise ValueError("星图节点上限必须在 1 到 1000 之间。")
+        return self._snapshot(query=query, limit=limit)
+
+    def generation_snapshot(self) -> KnowledgeGraph:
+        """Read a complete generation input independently of the UI display cap.
+
+        Bound unusually large libraries explicitly rather than exporting a
+        silently incomplete graph. This operation never writes to the library.
+        """
+        with self._database._connection() as connection:
+            total = sum(connection.execute(sql).fetchone()[0] for sql in (
+                "SELECT COUNT(*) FROM question_items",
+                "SELECT COUNT(*) FROM knowledge_objects WHERE lifecycle='active'",
+                "SELECT COUNT(*) FROM question_families WHERE status!='retired'",
+            ))
+        if total > 10000:
+            raise ValueError("完整图谱超过 10000 个学习与知识节点，暂不生成；请保留现有生成文件。")
+        return self._snapshot(query="", limit=max(1, total))
+
+    def _snapshot(self, *, query: str, limit: int) -> KnowledgeGraph:
+        """Project bounded primary entities, filling unused category allocations."""
+        nodes: dict[str, dict[str, Any]] = {}
+        links: list[dict[str, str]] = []
+        query = query.strip()
+        pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        tables = (
+            ("question", "question_items", "stem_text", "stem_text", "1=1"),
+            ("knowledge", "knowledge_objects", "title", "content", "lifecycle = 'active'"),
+            ("family", "question_families", "title", "description", "status != 'retired'"),
+        )
+        with self._database._connection() as connection:
+            total = 0
+            candidates: list[tuple[str, sqlite3.Row]] = []
+            reserves: list[tuple[str, list[sqlite3.Row]]] = []
+            # Equal per-kind allocation prevents a large question library hiding knowledge points.
+            per_kind = max(1, limit // 3)
+            for kind, table, title, content, condition in tables:
+                where = condition + (f" AND ({title} LIKE ? ESCAPE '\\' OR "
+                                     f"{content} LIKE ? ESCAPE '\\')" if query else "")
+                params = (pattern, pattern) if query else ()
+                total += connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {where}", params
+                ).fetchone()[0]
+                rows = connection.execute(
+                    f"SELECT * FROM {table} WHERE {where} ORDER BY id DESC LIMIT ?",
+                    (*params, limit),
+                ).fetchall()
+                candidates.extend((kind, row) for row in rows[:per_kind])
+                reserves.append((kind, rows[per_kind:]))
+            # A small or absent category must not consume other categories'
+            # display capacity or make complete generation silently truncate.
+            for kind, rows in reserves:
+                candidates.extend((kind, row) for row in rows[:max(0, limit - len(candidates))])
+            for kind, row in candidates[:limit]:
+                identifier = f"{kind}:{row['id']}"
+                title = row["stem_text"] if kind == "question" else row["title"]
+                if kind == "question":
+                    title = f"{row['question_number'] or '题目'} · {title[:70] or '待补题干'}"
+                summary = row["stem_text"] if kind == "question" else (
+                    row["content"] if kind == "knowledge" else row["description"]
+                )
+                nodes[identifier] = self._node(identifier, kind, title, summary)
+                if kind == "knowledge":
+                    nodes[identifier]["meta"] = {
+                        "confirmation_status": row["confirmation_status"],
+                        "confirmation_current": (
+                            row["confirmation_status"] == "confirmed"
+                            and row["confirmed_revision"] == row["current_revision"]
+                        ),
+                        "current_revision": row["current_revision"],
+                        "importance": row["importance"],
+                        "source_refs": [],
+                        "revision_refs": [{"knowledge_object_id": row["id"],
+                                           "revision": row["current_revision"]}],
+                    }
+            shown = len(nodes)
+            for kind, row in candidates[:limit]:
+                identifier = f"{kind}:{row['id']}"
+                if kind == "question":
+                    self._source(connection, nodes, links, identifier, row["document_id"],
+                                 row["page_id"])
+                    if row["document_id"] is None:
+                        nodes[identifier]["summary"] += (
+                            "\n原始来源已删除；保留来源记录："
+                            + (row["source_document_title_snapshot"] or "来源未记录")
+                            + " " + (row["source_page_label_snapshot"] or "")
+                        )
+                elif kind == "knowledge":
+                    sources = connection.execute(
+                        "SELECT source_type, source_id FROM knowledge_object_sources "
+                        "WHERE knowledge_object_id = ?", (row["id"],)
+                    ).fetchall()
+                    for source in sources:
+                        source_type, source_id = source
+                        nodes[identifier]["meta"]["source_refs"].append(
+                            {"source_type": source_type, "source_id": source_id})
+                        if source_type == "document":
+                            self._source(connection, nodes, links, identifier, source_id, None)
+                        elif source_type == "page":
+                            self._source(connection, nodes, links, identifier, None, source_id)
+                        elif source_type in ("note", "evidence"):
+                            table = "notes" if source_type == "note" else "evidence_items"
+                            anchor = connection.execute(
+                                f"SELECT document_id, page_id FROM {table} WHERE id = ?",
+                                (source_id,),
+                            ).fetchone()
+                            if anchor:
+                                self._source(connection, nodes, links, identifier, *anchor)
+                    # StudyStore identities are independent of platform IDs.
+                    # Only the explicit, saved-review bridge can supply these.
+                    from src.study_knowledge_bridge import knowledge_review_refs
+
+                    review_refs = knowledge_review_refs(
+                        self._database, row["id"], connection=connection,
+                    )
+                    nodes[identifier]["meta"]["revision_refs"].extend(review_refs)
+                    nodes[identifier]["meta"]["source_refs"].extend(review_refs)
+            for row in connection.execute("SELECT * FROM knowledge_relations"):
+                self._edge(nodes, links, f"knowledge:{row['source_ko_id']}",
+                           f"knowledge:{row['target_ko_id']}",
+                           KnowledgeRelationType(row["relation_type"]).label, row["description"])
+            for row in connection.execute("SELECT * FROM question_family_members"):
+                self._edge(nodes, links, f"question:{row['question_id']}",
+                           f"family:{row['family_id']}", "归纳成员",
+                           {"member": "成员题", "variant": "变式题",
+                            "counterexample": "反例题"}.get(row["relation"], ""))
+            for row in connection.execute("SELECT * FROM question_knowledge_links"):
+                self._edge(nodes, links, f"question:{row['question_id']}",
+                           f"knowledge:{row['knowledge_object_id']}", "涉及知识点", row["note"])
+            self._apply_subject_tags(connection, nodes)
+            self._apply_review_course_tags(nodes, links)
+        return KnowledgeGraph(nodes, links, int(total), shown)
+
+    @staticmethod
+    def _apply_review_course_tags(nodes: dict[str, Any], links: list[dict[str, str]]) -> None:
+        """Prefer exact StudyStore course identities for imported review stars."""
+        course_tags: dict[str, set[str]] = {}
+        for identifier, node in nodes.items():
+            refs = node.get("meta", {}).get("revision_refs", [])
+            courses = {course for ref in refs if isinstance(ref, dict)
+                       for course in (ref.get("course_ids") or [ref.get("course_id", "")])
+                       if course}
+            if courses:
+                node["meta"]["academic_subject_tags"] = list(node["tags"])
+                course_tags[identifier] = courses
+        # The same document/page may support more than one course. Display one
+        # stable source node attached to each course, not duplicated sources.
+        for edge in links:
+            if edge.get("label") in {"来自文档", "来自页面"} and edge["source"] in course_tags:
+                course_tags.setdefault(edge["target"], set()).update(course_tags[edge["source"]])
+        for edge in links:
+            if edge.get("label") == "所属文档" and edge["source"] in course_tags:
+                course_tags.setdefault(edge["target"], set()).update(course_tags[edge["source"]])
+        for identifier, courses in course_tags.items():
+            nodes[identifier]["tags"] = sorted(courses)
+
+    @staticmethod
+    def _node(identifier: str, kind: str, title: str, summary: str) -> dict[str, Any]:
+        return {"id": identifier, "entity_kind": kind, "title": title, "summary": summary,
+                "tags": [NODE_KINDS[kind]], "path": "", "meta": {}}
+
+    @staticmethod
+    def _apply_subject_tags(connection: sqlite3.Connection, nodes: dict[str, Any]) -> None:
+        """按学科重排星云：tags 决定星图分组，未确定学科的节点进入「未归类」。
+
+        题目直接取自身学科；知识点读取已保存的两级分类并继承关联题目的学科；
+        归纳族取关联题目的学科并集；
+        文档和页面承接引用它们的题目、知识点的学科并集。
+        """
+
+        question_subjects: dict[int, str] = {
+            row["id"]: subject_tag(row["subject"])
+            for row in connection.execute(
+                "SELECT id, subject FROM question_items "
+                "WHERE subject IS NOT NULL AND TRIM(subject) <> ''")
+        }
+        owner_subjects: dict[str, set[str]] = {
+            f"question:{question_id}": {subject}
+            for question_id, subject in question_subjects.items()
+        }
+        for row in connection.execute("SELECT * FROM knowledge_subject_classifications"):
+            tag = row["subject"] + (f"/{row['subdiscipline']}" if row["subdiscipline"] else "")
+            owner_subjects.setdefault(f"knowledge:{row['knowledge_object_id']}", set()).add(tag)
+        for row in connection.execute(
+                "SELECT knowledge_object_id, question_id FROM question_knowledge_links"):
+            subject = question_subjects.get(row["question_id"])
+            if subject:
+                owner_subjects.setdefault(
+                    f"knowledge:{row['knowledge_object_id']}", set()).add(subject)
+        for row in connection.execute(
+                "SELECT family_id, question_id FROM question_family_members"):
+            subject = question_subjects.get(row["question_id"])
+            if subject:
+                owner_subjects.setdefault(f"family:{row['family_id']}", set()).add(subject)
+        for row in connection.execute(
+                "SELECT id, document_id, page_id FROM question_items "
+                "WHERE document_id IS NOT NULL OR page_id IS NOT NULL"):
+            subject = question_subjects.get(row["id"])
+            if not subject:
+                continue
+            if row["document_id"] is not None:
+                owner_subjects.setdefault(
+                    f"document:{row['document_id']}", set()).add(subject)
+            if row["page_id"] is not None:
+                owner_subjects.setdefault(f"page:{row['page_id']}", set()).add(subject)
+        knowledge_subject_sets = {
+            int(identifier.split(":")[1]): subjects
+            for identifier, subjects in owner_subjects.items()
+            if identifier.startswith("knowledge:")
+        }
+        for row in connection.execute(
+                "SELECT s.knowledge_object_id, s.source_type, s.source_id, p.document_id "
+                "FROM knowledge_object_sources s LEFT JOIN pages p "
+                "ON s.source_type = 'page' AND p.id = s.source_id"):
+            subjects = knowledge_subject_sets.get(row["knowledge_object_id"])
+            if not subjects or row["source_type"] not in ("document", "page"):
+                continue
+            owner_subjects.setdefault(
+                f"{row['source_type']}:{row['source_id']}", set()).update(subjects)
+            if row["source_type"] == "page" and row["document_id"] is not None:
+                owner_subjects.setdefault(f"document:{row['document_id']}", set()).update(subjects)
+        for identifier, node in nodes.items():
+            node["tags"] = sorted(owner_subjects.get(identifier, ()))
+
+    @staticmethod
+    def _edge(nodes: dict, links: list, source: str, target: str,
+              label: str, note: str = "") -> None:
+        if source in nodes and target in nodes:
+            edge = {"source": source, "target": target, "label": label, "note": note}
+            if edge not in links:
+                links.append(edge)
+
+    def _source(self, connection: sqlite3.Connection, nodes: dict, links: list,
+                owner: str, document_id: int | None, page_id: int | None) -> None:
+        page = connection.execute("SELECT * FROM pages WHERE id = ?", (page_id,)).fetchone()
+        if page:
+            document_id = page["document_id"]
+        document = connection.execute(
+            "SELECT * FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if document:
+            doc_key = f"document:{document_id}"
+            nodes[doc_key] = self._node(
+                doc_key, "document", document["title"], document["filename"]
+            )
+            self._edge(nodes, links, owner, doc_key, "来自文档")
+        if page:
+            page_key = f"page:{page_id}"
+            title = (document["title"] if document else "来源") + f" · 第 {page['page_number']} 页"
+            nodes[page_key] = self._node(page_key, "page", title, page["extracted_text"] or "")
+            self._edge(nodes, links, owner, page_key, "来自页面")
+            if document:
+                self._edge(nodes, links, page_key, doc_key, "所属文档")

@@ -1,0 +1,2 @@
+# Optional local Word math import/export. No network access at runtime.
+pypandoc_binary==1.17

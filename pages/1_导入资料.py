@@ -1,0 +1,409 @@
+"""Import documents and let the local Agent read every page.
+
+Import state semantics (V086-101/203 fix): the file import itself and the AI
+page reading are two different statuses and must be reported separately.
+A document whose import completed is never presented as "导入失败" when only
+the AI reading step failed; the honest message is "已导入，AI 阅读未完成".
+
+V086-301 fix: the batch is now a durable queue (``import_queue`` table,
+schema v21).  Every uploaded file is persisted as a row **before**
+processing starts, so navigating away can pause a batch but can never
+silently erase it.  Files are isolated: one file's import/image-reading
+failure is recorded on its own row and never swallows the rest of the batch
+(V086-301 §6.4).
+
+v0.8.8 (P0-2/P0-3): long native-text PDFs are no longer read inside one
+Streamlit script run.  They are staged to durable disk, enqueued into the
+*same* ``import_queue`` table under a worker-owned batch id, and read by a
+detached subprocess (``src.long_read_worker``) that batches pages through
+``src.long_read_engine`` and checkpoints into the v39 ``long_read_task`` /
+``long_read_page`` tables.  Navigating away, closing the browser or
+restarting the app therefore cannot destroy the task, and the panel rendered
+by :mod:`src.long_read_ui` re-reads that durable state on every pass.
+Photos, Office files, short PDFs and scanned PDFs keep the existing in-page
+path unchanged, because that path drives ``PageImageReader`` and so also
+produces question candidates and figure registration.
+
+Reviewer offload item #6 is fixed here too: an interrupted batch is no longer
+resumed by asking the user to re-select the same files — the panel lists the
+interrupted/queued rows and continues them with one click.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import streamlit as st
+
+from src import __version__
+from src.agent.local_client import LocalDocumentAgentClient
+from src.agent_document_reader import AgentReadingStore
+from src.ai.provider import AIUnavailableError
+from src.import_queue_service import (
+    DEDUP_NOTICE,
+    ImportQueueEntry,
+    ImportQueueService,
+    new_run_id,
+)
+from src.long_read_ui import (
+    WORKER_BATCH_PREFIX,
+    render_file_picker,
+    render_import_action,
+    render_progress_panel,
+)
+from src.runtime import (
+    application_ai_provider,
+    application_database,
+    application_document_service,
+    application_page_image_reader,
+    application_settings,
+)
+from src.workspace_ui import render_workspace
+
+LOGGER = logging.getLogger(__name__)
+
+#: Worker-owned batches are excluded from the in-page queue view: their rows
+#: are processed from staged bytes by a separate OS process, and the in-page
+#: loop has no upload object for them (it would wrongly mark them unusable).
+_IN_PAGE_BATCH_FILTER = (WORKER_BATCH_PREFIX,)
+_RUN_ID_KEY = "import_page_run_id"
+_BATCH_ID_KEY = "import_page_batch_id"
+
+
+def _queue_service() -> ImportQueueService:
+    return ImportQueueService(application_database())
+
+
+def _local_agent_client() -> LocalDocumentAgentClient:
+    """Build the in-process Agent from the same local database as the page."""
+
+    settings = application_settings()
+    provider = application_ai_provider()
+    return LocalDocumentAgentClient(
+        database=application_database(),
+        provider=provider,
+        readings=AgentReadingStore(settings.agent_readings_dir),
+        page_image_reader=application_page_image_reader(),
+        model=provider.default_model if provider is not None else "",
+    )
+
+
+def _read_one_document(document_id: int, page_count: int) -> tuple[bool, str]:
+    """Run the page-by-page AI reading; return (fully_read, user_message)."""
+
+    progress = st.progress(0, text="正在读取……")
+
+    def update_progress(current: int, total: int) -> None:
+        ratio = current / total if total else 0
+        progress.progress(ratio, text=f"正在读取 {current} / {total} 页")
+
+    try:
+        _local_agent_client().read_document(
+            document_id, progress_callback=update_progress
+        )
+    except AIUnavailableError:
+        progress.empty()
+        return False, "AI 未配置：资料已保存，AI 阅读未执行；配置后可在「我的资料」重试。"
+    except Exception as exc:  # noqa: BLE001 - honest per-file reading outcome
+        LOGGER.exception("Agent 读取资料失败：document_id=%s", document_id)
+        progress.empty()
+        # The import itself completed at this point; only the AI reading of
+        # some pages failed. Keep the two statuses separate (V086-101/203).
+        return False, f"资料已导入，{exc}"
+    progress.progress(1.0, text=f"已读完 {page_count} / {page_count} 页")
+    # V086-212: success is expressed by the queue status (✅ 完成), never by
+    # writing text into error_message.
+    return True, ""
+
+
+def _import_one_file(
+    entry: ImportQueueEntry, file_content: bytes
+) -> tuple[int | None, bool]:
+    """Import and render all pages; recognition is performed by the image reader.
+
+    Returns ``(document_id, duplicate)``. Import failures raise; per-page
+    Image reading failures are isolated so one broken page never blocks later pages
+    (and one broken file never blocks the batch).
+    """
+
+    document_service = application_document_service()
+    result = document_service.import_document(
+        file_content=file_content,
+        filename=entry.filename,
+    )
+    return result.document.id, bool(result.duplicate)
+
+
+def _import_images_merged(uploads: list) -> dict[str, object]:
+    """Import the selected photos as ONE multi-page document (STEM P0-1).
+
+    Photos are ordered by filename so renaming before import controls the
+    page order.  Reading uses the same per-page agent reader as every other
+    source, and a duplicate batch is never re-read (no surprise paid calls).
+    """
+
+    ordered = sorted(uploads, key=lambda upload: str(upload.name))
+    document_service = application_document_service()
+    progress = st.progress(0.1, text=f"正在保存 {len(ordered)} 张照片……")
+    result = document_service.import_images(
+        [(upload.getvalue(), upload.name) for upload in ordered],
+    )
+    if result.duplicate:
+        progress.progress(1.0, text="这批照片已存在。")
+        return {
+            "document_id": result.document.id,
+            "pages": len(result.pages),
+            "duplicate": True,
+            "fully_read": True,
+            "message": "",
+        }
+    progress.progress(0.3, text="照片已保存，正在读取内容……")
+    fully_read, message = _read_one_document(result.document.id, len(ordered))
+    progress.progress(1.0, text="照片导入完成。")
+    return {
+        "document_id": result.document.id,
+        "pages": len(result.pages),
+        "duplicate": False,
+        "fully_read": fully_read,
+        "message": message,
+    }
+
+
+def _process_queue_entries(
+    entries: list[ImportQueueEntry], uploads_by_name: dict[str, object]
+) -> None:
+    """Process queue rows one by one with honest per-row state transitions."""
+
+    if not entries:
+        return
+    run_id = st.session_state.get(_RUN_ID_KEY) or new_run_id()
+    st.session_state[_RUN_ID_KEY] = run_id
+    queue = _queue_service()
+    overall = st.progress(0.0, text="正在处理上传队列……")
+    total = len(entries)
+    for index, entry in enumerate(entries):
+        overall.progress(
+            index / total if total else 1.0,
+            text=f"正在处理 {index + 1} / {total} 份：{entry.filename}",
+        )
+        queue.start_entry(entry.id, run_id=run_id)
+        upload = uploads_by_name.get(entry.filename)
+        if upload is None:
+            queue.mark_failed(entry.id, message="导入失败：文件内容不可用（请重新选择文件）。")
+            continue
+        try:
+            document_id, duplicate = _import_one_file(entry, upload.getvalue())
+        except Exception as exc:
+            LOGGER.exception("资料导入失败：filename=%s", entry.filename)
+            queue.mark_failed(entry.id, message=f"导入失败：{exc}")
+            continue
+        if document_id is None:
+            queue.mark_failed(entry.id, message="导入失败：未知错误。")
+            continue
+        if duplicate:
+            # Content dedup (V086-105): the document already exists; never
+            # re-trigger a paid AI reading for it. The neutral dedup note is
+            # informational (kept out of "success text" semantics, V086-212).
+            queue.mark_complete(
+                entry.id,
+                document_id=document_id,
+                message=DEDUP_NOTICE,
+            )
+            continue
+        fully_read, message = _read_one_document(
+            document_id, upload.page_count if hasattr(upload, "page_count") else 0
+        )
+        if fully_read:
+            queue.mark_complete(entry.id, document_id=document_id, message=message)
+        else:
+            # Honest separation (V086-306): the document exists and is
+            # usable; only the AI reading is not done.
+            queue.mark_imported(entry.id, document_id=document_id, message=message)
+    overall.progress(1.0, text="上传队列处理完成。")
+
+
+def _enqueue_and_process(uploads: list) -> list[ImportQueueEntry]:
+    """Enqueue uploaded files into the durable batch and process them now.
+
+    Shared by the general file uploader and the photo/image entry so both
+    paths have identical queue, dedup and resume semantics (§17: never a
+    second image backend).
+    """
+
+    queue = _queue_service()
+    uploads_by_name = {upload.name: upload for upload in uploads}
+    open_batch_id = queue.latest_open_batch_id(exclude_prefixes=_IN_PAGE_BATCH_FILTER)
+    reusable: list[ImportQueueEntry] = []
+    new_names = list(uploads_by_name)
+    if open_batch_id:
+        pending = queue.queued_entries(open_batch_id)
+        pending_names = {entry.filename for entry in pending}
+        reusable = [entry for entry in pending if entry.filename in uploads_by_name]
+        new_names = [name for name in uploads_by_name if name not in pending_names]
+    batch_id = open_batch_id or ""
+    if new_names:
+        batch_id = queue.enqueue_batch(new_names, batch_id=open_batch_id)
+    st.session_state[_BATCH_ID_KEY] = batch_id
+    if open_batch_id:
+        fresh = [
+            entry
+            for entry in queue.list_batch(batch_id)
+            if entry.status == "queued" and entry not in reusable
+        ]
+        entries = reusable + fresh
+    else:
+        entries = queue.list_batch(batch_id)
+    _process_queue_entries(entries, uploads_by_name)
+    # The queue section must reflect post-processing reality in the SAME run.
+    return queue.list_batch(batch_id)
+
+
+st.set_page_config(
+    page_title=f"导入资料 · Nectivon v{__version__}", page_icon="📥", layout="wide"
+)
+render_workspace("pages/1_导入资料.py")
+st.title("添加一份资料")
+st.caption("此入口只添加平台资料。学习材料请在「学习整理」首页单独导入。")
+st.caption(
+    "可以一次选择多个文件；点一下后 Agent 会逐份按页读完；原文件和每一页都保存在本机。"
+    "图片（JPG/PNG/WEBP）按原样保存为一份一页资料。"
+    "页数很多的课件 PDF 会交给后台独立进程分批读取，离开本页也不会中断。"
+)
+
+# Element 1 of the P0-3 import UI: the multi-file selection area. The
+# accepted-extension contract is unchanged from v0.8.7 (locked by tests).
+uploaded_documents = render_file_picker()
+
+# ---- 上传图片入口：原图保存为不可更改的证据，走同一 image 后端 ----
+st.subheader("上传图片")
+st.caption(
+    "选择电脑里的图片（JPG/PNG/WEBP），确认后按原样保存为本机资料；"
+    "相同内容的图片不会重复导入。"
+)
+uploaded_images = st.file_uploader(
+    "选择图片文件（可多选）",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    key="image_only_uploader",
+)
+image_uploads: list = []
+if uploaded_images:
+    image_uploads.extend(uploaded_images)
+if image_uploads:
+    try:
+        st.image(image_uploads[0].getvalue(), width=220, caption=image_uploads[0].name)
+    except Exception:  # noqa: BLE001 - preview must never block import
+        st.caption("（无法预览该图片，但不影响导入）")
+    st.caption(
+        f"已选择 {len(image_uploads)} 张图片："
+        + "、".join(u.name for u in image_uploads)
+    )
+    image_merge = st.toggle(
+        "合并为一份资料（推荐）",
+        value=True,
+        key="image_merge_toggle",
+        help=(
+            "同一套习题/同一页拍的多张照片合并成一份多页资料："
+            "跨照片的题目才能在识别后关联为题组。按文件名排序作为页序；"
+            "需要调整顺序请在导入前重命名照片。"
+        ),
+    )
+    image_confirmed = st.checkbox(
+        "确认使用这些图片（选错请重新选择）", key="image_confirm"
+    )
+    if image_confirmed and st.button(
+        "导入这些图片", key="import_images", type="primary"
+    ):
+        if image_merge and len(image_uploads) > 1:
+            try:
+                merged = _import_images_merged(image_uploads)
+            except Exception as exc:  # noqa: BLE001 - import failures surface honestly
+                LOGGER.exception("多照片合并导入失败")
+                st.error(f"多照片合并导入失败：{exc}")
+            else:
+                st.session_state[_RUN_ID_KEY] = new_run_id()
+                if merged["duplicate"]:
+                    st.info("这批照片此前已合并导入过，不会重复保存或重复调用 AI。")
+                elif merged["document_id"] is not None:
+                    if merged["fully_read"]:
+                        st.success(
+                            f"已合并导入 {merged['pages']} 张照片为一份资料，并完成内容读取。"
+                        )
+                    else:
+                        st.warning(
+                            f"已合并导入 {merged['pages']} 张照片；内容读取未全部完成"
+                            f"（{merged['message'] or '部分照片读取失败'}）。"
+                            "可到「查看识别结果」重试读取。"
+                        )
+                    if st.button(
+                        "下一步：去待核对题目 →",
+                        key=f"go_review_merged_{merged['document_id']}",
+                        type="primary",
+                    ):
+                        st.switch_page("pages/5_待整理页面.py")
+        else:
+            try:
+                batch_entries = _enqueue_and_process(image_uploads)
+            except Exception as exc:  # noqa: BLE001 - queue failures surface honestly
+                LOGGER.exception("图片导入队列处理失败")
+                st.error(f"图片导入队列处理失败：{exc}")
+            else:
+                st.session_state[_RUN_ID_KEY] = new_run_id()
+                complete = sum(1 for e in batch_entries if e.status == "complete")
+                st.success(f"图片处理完成：{complete} / {len(batch_entries)} 份成功。")
+
+# ---- durable queue state: recovered before anything renders (V086-301) ----
+try:
+    st.session_state.setdefault(_RUN_ID_KEY, new_run_id())
+    queue = _queue_service()
+    # A dead run's in-flight rows are marked interrupted so the batch tells
+    # the truth instead of pretending nothing happened. Worker-owned batches
+    # are excluded: their run id belongs to a live detached process, so the
+    # page must not declare them dead (v0.8.8).
+    queue.recover_stale_inflight(
+        str(st.session_state[_RUN_ID_KEY]), exclude_prefixes=_IN_PAGE_BATCH_FILTER
+    )
+    open_batch_id = queue.latest_open_batch_id(exclude_prefixes=_IN_PAGE_BATCH_FILTER)
+    current_batch_id = open_batch_id or queue.latest_batch_id()
+    batch_entries = queue.list_batch(current_batch_id) if current_batch_id else []
+    # The empty-screen guard must also see worker-owned batches, otherwise a
+    # running background import would be hidden behind「先选择一份资料」.
+    has_durable_records = bool(queue.dashboard_batch_ids())
+except Exception as exc:  # noqa: BLE001 - queue outage must not kill the page
+    LOGGER.exception("导入队列初始化失败")
+    st.error(f"导入队列暂时不可用：{exc}")
+    queue = None
+    batch_entries = []
+    has_durable_records = False
+
+if not uploaded_documents and not has_durable_records:
+    st.info("先选择一份资料。普通文字会直接读取，图片或手写页面会自动尝试识别。")
+    st.stop()
+
+# Elements 1b-11 of the P0-3 import UI. The action returns the files that
+# must still go through this page's own (unchanged) in-page import path.
+pending_in_page: list = []
+if queue is not None and uploaded_documents:
+    pending_in_page = render_import_action(
+        application_database(), uploads=uploaded_documents
+    )
+
+if pending_in_page:
+    try:
+        batch_entries = _enqueue_and_process(pending_in_page)
+    except Exception as exc:  # noqa: BLE001 - queue failures surface honestly
+        LOGGER.exception("导入队列处理失败")
+        st.error(f"导入队列处理失败：{exc}")
+    else:
+        st.session_state[_RUN_ID_KEY] = new_run_id()  # next run is a new run
+
+if queue is not None:
+    # Durable panel: file list, per-file status, global progress, current
+    # page/stage, real elapsed time, ETA, failure detail and the always
+    # visible 暂停 / 继续读取 / 取消读取 controls. Every number is re-read
+    # from SQLite on each pass, so switching pages and coming back — or
+    # restarting the app — shows the same real state.
+    render_progress_panel(application_database())
+elif not uploaded_documents:
+    st.info("选择文件后点一下开始导入。")
+

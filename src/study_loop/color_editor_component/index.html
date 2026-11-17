@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<link rel="stylesheet" href="editor.css"><script defer src="selection.js"></script><script defer src="editor.js"></script>
+<title>复盘三色编辑</title></head><body>
+<label id="label" for="body">正文</label>
+<div role="toolbar" aria-label="选中文字颜色">
+<button type="button" data-color="222222">黑色 · 普通／取消颜色</button>
+<button type="button" data-color="D62828">红色 · 重点</button>
+<button type="button" data-color="2563EB">蓝色 · 注意</button>
+</div>
+<textarea id="body" spellcheck="false"></textarea>
+<p id="status" role="status" aria-live="polite">选中文字后设置颜色；公式选区会保留完整公式。</p>
+</body></html>

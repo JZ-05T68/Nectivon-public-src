@@ -1,0 +1,7 @@
+:root{font-family:"Microsoft YaHei",sans-serif;color:var(--note-text,#222222);background:transparent;font-size:16px}
+body{margin:0}label{display:block;margin:0 0 6px}div[role=toolbar]{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+button{font:inherit;color:var(--note-text,#222222);background:var(--note-surface,white);border:1px solid var(--note-border,#999);border-radius:6px;padding:6px 10px;cursor:pointer}
+button[data-color=D62828]{color:var(--note-note_red,#D62828)}button[data-color="2563EB"]{color:var(--note-note_blue,#2563EB)}
+button:focus-visible,textarea:focus-visible{outline:2px solid #2563EB;outline-offset:2px}
+textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:160px;padding:12px;font:inherit;line-height:1.6;color:var(--note-text,#222222);border:1px solid var(--note-border,#999);border-radius:6px;background:var(--note-surface,white)}
+p{margin:6px 0 0;font-size:13px;color:var(--note-muted,#5c6c80)}

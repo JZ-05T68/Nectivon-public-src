@@ -1,0 +1,151 @@
+{
+  "extraction": {
+    "绪论": {
+      "pages": 22,
+      "empty_text_pages": 0,
+      "visual_content_pages": 22,
+      "extract_total_ms": 18.19,
+      "extract_mean_ms": 0.827,
+      "extract_median_ms": 0.305,
+      "extract_p95_ms": 5.672,
+      "chars_mean": 94.0,
+      "chars_median": 75.5,
+      "chars_max": 251,
+      "chars_min": 5,
+      "vision_trigger_by_threshold": {
+        "<20_chars_AND_visual": "5/22",
+        "<40_chars_AND_visual": "5/22",
+        "<60_chars_AND_visual": "8/22",
+        "<80_chars_AND_visual": "12/22",
+        "<100_chars_AND_visual": "14/22",
+        "<150_chars_AND_visual": "17/22"
+      }
+    },
+    "第七章 典型液压传动系统": {
+      "pages": 32,
+      "empty_text_pages": 0,
+      "visual_content_pages": 32,
+      "extract_total_ms": 17.59,
+      "extract_mean_ms": 0.55,
+      "extract_median_ms": 0.28,
+      "extract_p95_ms": 2.759,
+      "chars_mean": 90.3,
+      "chars_median": 99.5,
+      "chars_max": 336,
+      "chars_min": 8,
+      "vision_trigger_by_threshold": {
+        "<20_chars_AND_visual": "5/32",
+        "<40_chars_AND_visual": "10/32",
+        "<60_chars_AND_visual": "11/32",
+        "<80_chars_AND_visual": "12/32",
+        "<100_chars_AND_visual": "16/32",
+        "<150_chars_AND_visual": "28/32"
+      }
+    }
+  },
+  "model_calls": {
+    "model": "qwen3.8-max",
+    "batch_sizes": {
+      "1": [
+        {
+          "call_ms": 2061.6,
+          "per_page_ms": 2061.6,
+          "prompt_chars": 471,
+          "output_chars": 133,
+          "budget": 1600,
+          "finish_reason": "stop",
+          "truncated": false
+        },
+        {
+          "call_ms": 2316.4,
+          "per_page_ms": 2316.4,
+          "prompt_chars": 477,
+          "output_chars": 137,
+          "budget": 1600,
+          "finish_reason": "stop",
+          "truncated": false
+        }
+      ],
+      "2": [
+        {
+          "call_ms": 2842.2,
+          "per_page_ms": 1421.1,
+          "prompt_chars": 529,
+          "output_chars": 263,
+          "budget": 1607,
+          "finish_reason": "stop",
+          "truncated": false
+        },
+        {
+          "call_ms": 6227.8,
+          "per_page_ms": 3113.9,
+          "prompt_chars": 714,
+          "output_chars": 633,
+          "budget": 1668,
+          "finish_reason": "stop",
+          "truncated": false
+        }
+      ],
+      "4": [
+        {
+          "call_ms": 12717.8,
+          "per_page_ms": 3179.5,
+          "prompt_chars": 1274,
+          "output_chars": 1356,
+          "budget": 3008,
+          "finish_reason": "stop",
+          "truncated": false
+        },
+        {
+          "call_ms": 15131.6,
+          "per_page_ms": 3782.9,
+          "prompt_chars": 939,
+          "output_chars": 1518,
+          "budget": 2906,
+          "finish_reason": "stop",
+          "truncated": false
+        }
+      ],
+      "6": [
+        {
+          "call_ms": 10548.8,
+          "per_page_ms": 1758.1,
+          "prompt_chars": 916,
+          "output_chars": 1052,
+          "budget": 4082,
+          "finish_reason": "stop",
+          "truncated": false
+        },
+        {
+          "call_ms": 9679.4,
+          "per_page_ms": 1613.2,
+          "prompt_chars": 916,
+          "output_chars": 1057,
+          "budget": 4082,
+          "finish_reason": "stop",
+          "truncated": false
+        }
+      ],
+      "8": [
+        {
+          "call_ms": 14409.8,
+          "per_page_ms": 1801.2,
+          "prompt_chars": 1334,
+          "output_chars": 1604,
+          "budget": 5385,
+          "finish_reason": "stop",
+          "truncated": false
+        },
+        {
+          "call_ms": 14883.4,
+          "per_page_ms": 1860.4,
+          "prompt_chars": 1334,
+          "output_chars": 1680,
+          "budget": 5385,
+          "finish_reason": "stop",
+          "truncated": false
+        }
+      ]
+    }
+  }
+}
